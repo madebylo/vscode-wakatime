@@ -500,14 +500,17 @@ export class WakaTime {
 
   private onChangeTextDocument(e: vscode.TextDocumentChangeEvent): void {
     this.logger.debug('onChangeTextDocument');
+    let isAICodeChange = false;
     if (Utils.isAIChatSidebar(e.document?.uri)) {
       this.isAICodeGenerating = true;
       this.AIdebounceCount = 0;
+      isAICodeChange = true;
     } else if (Utils.isPossibleAICodeInsert(e)) {
       const now = Date.now();
       if (this.recentlyAIPasted(now) && this.hasAICapabilities) {
         this.isAICodeGenerating = true;
         this.AIdebounceCount = 0;
+        isAICodeChange = true;
       }
       this.AIrecentPastes.push(now);
     } else if (Utils.isPossibleHumanCodeInsert(e)) {
@@ -525,6 +528,13 @@ export class WakaTime {
       this.AIdebounceCount = 0;
       clearTimeout(this.AIDebounceId);
       this.updateLineNumbers();
+      isAICodeChange = true;
+    }
+
+    // If AI code was detected, send a hardbeat immediately.
+    if (this.isAICodeGenerating && isAICodeChange) {
+      this.onEvent(true);
+      return;
     }
 
     if (!this.isAICodeGenerating) return;
@@ -548,7 +558,6 @@ export class WakaTime {
 
   private onSave(_e: vscode.TextDocument | undefined): void {
     this.logger.debug('onSave');
-    this.isAICodeGenerating = false;
     this.updateLineNumbers();
     this.onEvent(true);
   }
@@ -586,6 +595,10 @@ export class WakaTime {
   }
 
   private onEvent(isWrite: boolean): void {
+    const isAICodingAtEvent = this.isAICodeGenerating;
+    const isCompilingAtEvent = this.isCompiling;
+    const isDebuggingAtEvent = this.isDebugging;
+
     if (Date.now() - this.lastSent > SEND_BUFFER_SECONDS * 1000) {
       this.sendHeartbeats();
     }
@@ -611,24 +624,24 @@ export class WakaTime {
             isWrite ||
             Utils.enoughTimePassed(this.lastHeartbeat, time) ||
             this.lastFile !== file ||
-            this.lastDebug !== this.isDebugging ||
-            this.lastCompile !== this.isCompiling ||
-            this.lastAICodeGenerating !== this.isAICodeGenerating
+            this.lastDebug !== isDebuggingAtEvent ||
+            this.lastCompile !== isCompilingAtEvent ||
+            this.lastAICodeGenerating !== isAICodingAtEvent
           ) {
             this.appendHeartbeat(
               doc,
               time,
               editor.selection.start,
               isWrite,
-              this.isCompiling,
-              this.isDebugging,
-              this.isAICodeGenerating,
+              isCompilingAtEvent,
+              isDebuggingAtEvent,
+              isAICodingAtEvent,
             );
             this.lastFile = file;
             this.lastHeartbeat = time;
-            this.lastDebug = this.isDebugging;
-            this.lastCompile = this.isCompiling;
-            this.lastAICodeGenerating = this.isAICodeGenerating;
+            this.lastDebug = isDebuggingAtEvent;
+            this.lastCompile = isCompilingAtEvent;
+            this.lastAICodeGenerating = isAICodingAtEvent;
           }
         }
       }
@@ -676,6 +689,8 @@ export class WakaTime {
     } else if (Utils.isPullRequest(doc.uri)) {
       heartbeat.category = 'code reviewing';
     }
+
+    if (!heartbeat.category) heartbeat.category = 'human coding' as Heartbeat['category'];
 
     const project = this.getProjectName(doc.uri);
     if (project) heartbeat.alternate_project = project;
