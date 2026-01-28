@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
 
 import {
-  AI_RECENT_PASTES_TIME_MS,
   COMMAND_DASHBOARD,
   Heartbeat,
+  INTERACTION_NEAR_LINES,
   LogLevel,
+  RECENT_USER_INTERACTION_MS,
   SEND_BUFFER_SECONDS,
 } from '../constants';
 
@@ -30,7 +31,10 @@ export class WakaTime {
   private AIDebounceId: any = null;
   private AIdebounceMs = 1000;
   private AIdebounceCount = 0;
-  private AIrecentPastes: number[] = [];
+  /** Per-file: last user interaction (cursor/selection or typing). Tab/focus alone does NOT count. */
+  private lastUserInteractionInFile: {
+    [file: string]: { time: number; line: number; lineEnd: number };
+  } = {};
   private logger: Logger;
   private config: Memento;
   private fetchTodayInterval: number = 60000;
@@ -423,28 +427,50 @@ export class WakaTime {
     if (e.kind === vscode.TextEditorSelectionChangeKind.Command) return;
     if (Utils.isAIChatSidebar(e.textEditor?.document?.uri)) {
       this.isAICodeGenerating = true;
+    } else {
+      const file = Utils.getFocusedFile(e.textEditor?.document);
+      const sel = e.selections?.[0];
+      const startLine = sel?.start?.line ?? 0;
+      const endLine = sel?.end?.line ?? startLine;
+      if (file) this.lastUserInteractionInFile[file] = { time: Date.now(), line: startLine, lineEnd: endLine };
     }
     this.updateLineNumbers();
     this.onEvent(false);
   }
 
+  private getChangeLine(e: vscode.TextDocumentChangeEvent): number {
+    if (!e.contentChanges?.length) return 0;
+    return Math.min(...e.contentChanges.map((c) => c.range.start.line));
+  }
+
+  private hadRecentUserInteractionInFile(
+    file: string | undefined,
+    changeLine?: number,
+  ): boolean {
+    if (!file) return false;
+    const last = this.lastUserInteractionInFile[file];
+    if (!last) return false;
+    if (Date.now() - last.time > RECENT_USER_INTERACTION_MS) return false;
+    if (changeLine != null) {
+      const minLine = last.line - INTERACTION_NEAR_LINES;
+      const maxLine = (last.lineEnd ?? last.line) + INTERACTION_NEAR_LINES;
+      if (changeLine < minLine || changeLine > maxLine) return false;
+    }
+    return true;
+  }
+
   private onChangeTextDocument(e: vscode.TextDocumentChangeEvent): void {
     this.logger.debug('onChangeTextDocument');
+    const file = Utils.getFocusedFile(e.document) ?? e.document.fileName;
+    const changeLine = this.getChangeLine(e);
     let isAICodeChange = false;
+
     if (Utils.isAIChatSidebar(e.document?.uri)) {
       this.isAICodeGenerating = true;
       this.AIdebounceCount = 0;
       isAICodeChange = true;
-    } else if (Utils.isPossibleAICodeInsert(e)) {
-      const now = Date.now();
-      if (this.recentlyAIPasted(now) && this.hasAICapabilities) {
-        this.isAICodeGenerating = true;
-        this.AIdebounceCount = 0;
-        isAICodeChange = true;
-      }
-      this.AIrecentPastes.push(now);
     } else if (Utils.isPossibleHumanCodeInsert(e)) {
-      this.AIrecentPastes = [];
+      this.lastUserInteractionInFile[file] = { time: Date.now(), line: changeLine, lineEnd: changeLine };
       if (this.isAICodeGenerating) {
         this.AIdebounceCount++;
         clearTimeout(this.AIDebounceId);
@@ -454,14 +480,35 @@ export class WakaTime {
           }
         }, this.AIdebounceMs);
       }
-    } else if (this.isAICodeGenerating) {
-      this.AIdebounceCount = 0;
-      clearTimeout(this.AIDebounceId);
-      this.updateLineNumbers();
-      isAICodeChange = true;
+    } else if (Utils.isPossibleAICodeInsert(e)) {
+      const now = Date.now();
+      if (this.hadRecentUserInteractionInFile(file, changeLine)) {
+        this.lastUserInteractionInFile[file] = { time: now, line: changeLine, lineEnd: changeLine };
+      } else if (this.hasAICapabilities) {
+        this.isAICodeGenerating = true;
+        this.AIdebounceCount = 0;
+        isAICodeChange = true;
+      } else {
+        this.lastUserInteractionInFile[file] = { time: now, line: changeLine, lineEnd: changeLine };
+      }
+    } else {
+      if (this.hadRecentUserInteractionInFile(file, changeLine)) {
+        this.lastUserInteractionInFile[file] = { time: Date.now(), line: changeLine, lineEnd: changeLine };
+      } else if (this.isAICodeGenerating) {
+        this.AIdebounceCount = 0;
+        clearTimeout(this.AIDebounceId);
+        this.updateLineNumbers();
+        isAICodeChange = true;
+      } else if (this.hasAICapabilities) {
+        this.isAICodeGenerating = true;
+        this.AIdebounceCount = 0;
+        this.updateLineNumbers();
+        isAICodeChange = true;
+      }
     }
+
     if (this.isAICodeGenerating && isAICodeChange) {
-      this.onEvent(true);
+      this.onEvent(true, e.document);
       return;
     }
     if (!this.isAICodeGenerating) return;
@@ -520,7 +567,7 @@ export class WakaTime {
     this.linesInFiles[file] = current;
   }
 
-  private onEvent(isWrite: boolean): void {
+  private onEvent(isWrite: boolean, documentForHeartbeat?: vscode.TextDocument): void {
     const isAICodingAtEvent = this.isAICodeGenerating;
     const isCompilingAtEvent = this.isCompiling;
     const isDebuggingAtEvent = this.isDebugging;
@@ -531,43 +578,44 @@ export class WakaTime {
     clearTimeout(this.debounceId);
     this.debounceId = setTimeout(() => {
       if (this.disabled) return;
-      const editor = vscode.window.activeTextEditor;
-      if (editor) {
-        const doc = editor.document;
-        if (doc) {
-          const file = Utils.getFocusedFile(doc);
-          if (!file) {
-            return;
-          }
-          if (this.currentlyFocusedFile !== file) {
-            this.updateTeamStatusBarFromJson();
-            this.updateTeamStatusBar(doc);
-          }
+      const doc = documentForHeartbeat ?? vscode.window.activeTextEditor?.document;
+      const editor = documentForHeartbeat
+        ? vscode.window.visibleTextEditors.find((ed) => ed.document === documentForHeartbeat)
+        : vscode.window.activeTextEditor;
+      const selection = editor?.selection?.start ?? new vscode.Position(0, 0);
+      if (doc) {
+        const file = Utils.getFocusedFile(doc);
+        if (!file) {
+          return;
+        }
+        if (this.currentlyFocusedFile !== file) {
+          this.updateTeamStatusBarFromJson();
+          this.updateTeamStatusBar(doc);
+        }
 
-          const time: number = Date.now();
-          if (
-            isWrite ||
-            Utils.enoughTimePassed(this.lastHeartbeat, time) ||
-            this.lastFile !== file ||
-            this.lastDebug !== isDebuggingAtEvent ||
-            this.lastCompile !== isCompilingAtEvent ||
-            this.lastAICodeGenerating !== isAICodingAtEvent
-          ) {
-            this.appendHeartbeat(
-              doc,
-              time,
-              editor.selection.start,
-              isWrite,
-              isCompilingAtEvent,
-              isDebuggingAtEvent,
-              isAICodingAtEvent,
-            );
-            this.lastFile = file;
-            this.lastHeartbeat = time;
-            this.lastDebug = isDebuggingAtEvent;
-            this.lastCompile = isCompilingAtEvent;
-            this.lastAICodeGenerating = isAICodingAtEvent;
-          }
+        const time: number = Date.now();
+        if (
+          isWrite ||
+          Utils.enoughTimePassed(this.lastHeartbeat, time) ||
+          this.lastFile !== file ||
+          this.lastDebug !== isDebuggingAtEvent ||
+          this.lastCompile !== isCompilingAtEvent ||
+          this.lastAICodeGenerating !== isAICodingAtEvent
+        ) {
+          this.appendHeartbeat(
+            doc,
+            time,
+            selection,
+            isWrite,
+            isCompilingAtEvent,
+            isDebuggingAtEvent,
+            isAICodingAtEvent,
+          );
+          this.lastFile = file;
+          this.lastHeartbeat = time;
+          this.lastDebug = isDebuggingAtEvent;
+          this.lastCompile = isCompilingAtEvent;
+          this.lastAICodeGenerating = isAICodingAtEvent;
         }
       }
     }, this.debounceMs);
@@ -636,6 +684,7 @@ export class WakaTime {
     this.logger.debug(`Appending heartbeat to local buffer: ${JSON.stringify(heartbeat, null, 2)}`);
     this.heartbeats.push(heartbeat);
 
+    // Send when 30s buffer has passed (same for human and AI)
     if (now - this.lastSent > SEND_BUFFER_SECONDS * 1000) {
       await this.sendHeartbeats();
     }
@@ -914,11 +963,6 @@ export class WakaTime {
     } else {
       this.updateTeamStatusBarTextForOther();
     }
-  }
-
-  private recentlyAIPasted(time: number): boolean {
-    this.AIrecentPastes = this.AIrecentPastes.filter((x) => x + AI_RECENT_PASTES_TIME_MS >= time);
-    return this.AIrecentPastes.length > 3;
   }
 
   private isDuplicateHeartbeat(file: string, time: number, selection: vscode.Position): boolean {

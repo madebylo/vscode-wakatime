@@ -6,10 +6,11 @@ import * as os from 'os';
 import * as vscode from 'vscode';
 
 import {
-  AI_RECENT_PASTES_TIME_MS,
   COMMAND_DASHBOARD,
   Heartbeat,
+  INTERACTION_NEAR_LINES,
   LogLevel,
+  RECENT_USER_INTERACTION_MS,
   SEND_BUFFER_SECONDS,
 } from './constants';
 import { Options, Setting } from './options';
@@ -37,7 +38,6 @@ export class WakaTime {
   private AIDebounceId: any = null;
   private AIdebounceMs = 1000;
   private AIdebounceCount = 0;
-  private AIrecentPastes: number[] = [];
   private dependencies: Dependencies;
   private options: Options;
   private logger: Logger;
@@ -62,6 +62,10 @@ export class WakaTime {
   private lastSent: number = 0;
   private linesInFiles: Lines = {};
   private lineChanges: LineCounts = { ai: {}, human: {} };
+  /** Per-file: last user interaction (cursor/selection or typing) – time and line range. Tab/focus alone does NOT count. */
+  private lastUserInteractionInFile: {
+    [file: string]: { time: number; line: number; lineEnd: number };
+  } = {};
 
   constructor(extensionPath: string, logger: Logger) {
     this.extensionPath = extensionPath;
@@ -118,6 +122,20 @@ export class WakaTime {
       this.resourcesLocation = folder;
     } catch (e) {
       this.resourcesLocation = this.extensionPath;
+    }
+  }
+
+  /** Appends one formatted activity line (event + key=value, no CUSTOM LOG). */
+  private writeActivityLog(event: string, data: Record<string, string | number | undefined>): void {
+    try {
+      const ts = new Date().toISOString();
+      const parts = Object.entries(data)
+        .filter(([, v]) => v !== undefined && v !== '')
+        .map(([k, v]) => `${k}=${String(v).includes(' ') ? `"${String(v).replace(/"/g, '\\"')}"` : v}`);
+      const line = `${ts}  [WakaTime]  ${event}  ${parts.join('  ')}\n`;
+      fs.appendFileSync(this.options.getLogFile(), line, 'utf8');
+    } catch (e) {
+      this.logger.debugException(e);
     }
   }
 
@@ -493,28 +511,63 @@ export class WakaTime {
     if (e.kind === vscode.TextEditorSelectionChangeKind.Command) return;
     if (Utils.isAIChatSidebar(e.textEditor?.document?.uri)) {
       this.isAICodeGenerating = true;
+    } else {
+      // User clicked or moved cursor/selection in this file (selection can span multiple lines)
+      const file = Utils.getFocusedFile(e.textEditor?.document);
+      const sel = e.selections?.[0];
+      const startLine = sel?.start?.line ?? 0;
+      const endLine = sel?.end?.line ?? startLine;
+      if (file) this.lastUserInteractionInFile[file] = { time: Date.now(), line: startLine, lineEnd: endLine };
     }
     this.updateLineNumbers();
     this.onEvent(false);
   }
 
+  /** First line where the change happened (min of all contentChanges start lines). */
+  private getChangeLine(e: vscode.TextDocumentChangeEvent): number {
+    if (!e.contentChanges?.length) return 0;
+    return Math.min(...e.contentChanges.map((c) => c.range.start.line));
+  }
+
+  /** Last line touched by the change (max of all contentChanges end lines). */
+  private getChangeLineEnd(e: vscode.TextDocumentChangeEvent): number {
+    if (!e.contentChanges?.length) return 0;
+    return Math.max(...e.contentChanges.map((c) => c.range.end.line));
+  }
+
+  /** True if user interacted in this file (cursor/selection or typing, NOT tab/focus) recently and changeLine is same line or within ±INTERACTION_NEAR_LINES. */
+  private hadRecentUserInteractionInFile(
+    file: string | undefined,
+    changeLine?: number,
+  ): boolean {
+    if (!file) return false;
+    const last = this.lastUserInteractionInFile[file];
+    if (!last) return false;
+    if (Date.now() - last.time > RECENT_USER_INTERACTION_MS) return false;
+    if (changeLine != null) {
+      const minLine = last.line - INTERACTION_NEAR_LINES;
+      const maxLine = (last.lineEnd ?? last.line) + INTERACTION_NEAR_LINES;
+      if (changeLine < minLine || changeLine > maxLine) return false;
+    }
+    return true;
+  }
+
   private onChangeTextDocument(e: vscode.TextDocumentChangeEvent): void {
     this.logger.debug('onChangeTextDocument');
+    const file = Utils.getFocusedFile(e.document) ?? e.document.fileName;
+    const changeLine = this.getChangeLine(e);
     let isAICodeChange = false;
+    let changeSource: 'ai' | 'human' | 'unknown' = 'unknown';
+
     if (Utils.isAIChatSidebar(e.document?.uri)) {
       this.isAICodeGenerating = true;
       this.AIdebounceCount = 0;
       isAICodeChange = true;
-    } else if (Utils.isPossibleAICodeInsert(e)) {
-      const now = Date.now();
-      if (this.recentlyAIPasted(now) && this.hasAICapabilities) {
-        this.isAICodeGenerating = true;
-        this.AIdebounceCount = 0;
-        isAICodeChange = true;
-      }
-      this.AIrecentPastes.push(now);
+      changeSource = 'ai';
     } else if (Utils.isPossibleHumanCodeInsert(e)) {
-      this.AIrecentPastes = [];
+      // Single char or single delete = human typing (only this and cursor/selection count as interaction; tab/focus do not)
+      changeSource = 'human';
+      this.lastUserInteractionInFile[file] = { time: Date.now(), line: changeLine, lineEnd: changeLine };
       if (this.isAICodeGenerating) {
         this.AIdebounceCount++;
         clearTimeout(this.AIDebounceId);
@@ -524,16 +577,63 @@ export class WakaTime {
           }
         }, this.AIdebounceMs);
       }
-    } else if (this.isAICodeGenerating) {
-      this.AIdebounceCount = 0;
-      clearTimeout(this.AIDebounceId);
-      this.updateLineNumbers();
-      isAICodeChange = true;
+    } else if (Utils.isPossibleAICodeInsert(e)) {
+      // Large insert: human only if user recently cursor/selection/typed NEAR this line; else AI
+      const now = Date.now();
+      if (this.hadRecentUserInteractionInFile(file, changeLine)) {
+        changeSource = 'human';
+        this.lastUserInteractionInFile[file] = { time: now, line: changeLine, lineEnd: changeLine };
+      } else if (this.hasAICapabilities) {
+        changeSource = 'ai';
+        this.isAICodeGenerating = true;
+        this.AIdebounceCount = 0;
+        isAICodeChange = true;
+      } else {
+        changeSource = 'human';
+        this.lastUserInteractionInFile[file] = { time: now, line: changeLine, lineEnd: changeLine };
+      }
+    } else {
+      // Other edits: same rule – recent interaction NEAR change = human; else AI if capable
+      if (this.hadRecentUserInteractionInFile(file, changeLine)) {
+        changeSource = 'human';
+        this.lastUserInteractionInFile[file] = { time: Date.now(), line: changeLine, lineEnd: changeLine };
+      } else if (this.isAICodeGenerating) {
+        changeSource = 'ai';
+        this.AIdebounceCount = 0;
+        clearTimeout(this.AIDebounceId);
+        this.updateLineNumbers();
+        isAICodeChange = true;
+      } else if (this.hasAICapabilities) {
+        changeSource = 'ai';
+        this.isAICodeGenerating = true;
+        this.AIdebounceCount = 0;
+        this.updateLineNumbers();
+        isAICodeChange = true;
+      }
     }
 
-    // If AI code was detected, send a hardbeat immediately.
+    // Unclear cases: treat as human so we never log "unknown"
+    if (changeSource === 'unknown') changeSource = 'human';
+
+    // Activity log: change with file, project, source, line range, lines
+    const changeCount = e.contentChanges?.length ?? 0;
+    const totalChars = e.contentChanges?.reduce((sum, c) => sum + (c.text?.length ?? 0), 0) ?? 0;
+    const project = this.getProjectName(e.document.uri);
+    this.writeActivityLog('change', {
+      file,
+      project,
+      source: changeSource,
+      line: changeLine,
+      lineEnd: this.getChangeLineEnd(e),
+      lines: e.document.lineCount,
+      changes: changeCount,
+      chars: totalChars,
+    });
+
+    // If AI code was detected, send a heartbeat immediately. Pass e.document so we use the edited file
+    // (focus is often in Chat, so activeTextEditor would be wrong and no heartbeat would be sent).
     if (this.isAICodeGenerating && isAICodeChange) {
-      this.onEvent(true);
+      this.onEvent(true, e.document);
       return;
     }
 
@@ -542,9 +642,10 @@ export class WakaTime {
     this.onEvent(false);
   }
 
-  private onChangeTab(_e: vscode.TextEditor | undefined): void {
+  private onChangeTab(_editor: vscode.TextEditor | undefined): void {
     this.logger.debug('onChangeTab');
     this.isAICodeGenerating = false;
+    // Tab/focus alone do NOT count as interaction – only cursor/selection or typing do
     this.updateLineNumbers();
     this.onEvent(false);
   }
@@ -594,7 +695,7 @@ export class WakaTime {
     this.linesInFiles[file] = current;
   }
 
-  private onEvent(isWrite: boolean): void {
+  private onEvent(isWrite: boolean, documentForHeartbeat?: vscode.TextDocument): void {
     const isAICodingAtEvent = this.isAICodeGenerating;
     const isCompilingAtEvent = this.isCompiling;
     const isDebuggingAtEvent = this.isDebugging;
@@ -606,43 +707,46 @@ export class WakaTime {
     clearTimeout(this.debounceId);
     this.debounceId = setTimeout(() => {
       if (this.disabled) return;
-      const editor = vscode.window.activeTextEditor;
-      if (editor) {
-        const doc = editor.document;
-        if (doc) {
-          const file = Utils.getFocusedFile(doc);
-          if (!file) {
-            return;
-          }
-          if (this.currentlyFocusedFile !== file) {
-            this.updateTeamStatusBarFromJson();
-            this.updateTeamStatusBar(doc);
-          }
+      // When only AI edits: focus is in Chat, so use the document we got from the change event.
+      const doc = documentForHeartbeat ?? vscode.window.activeTextEditor?.document;
+      const editor = documentForHeartbeat
+        ? vscode.window.visibleTextEditors.find((e) => e.document === documentForHeartbeat)
+        : vscode.window.activeTextEditor;
+      const selection = editor?.selection?.start ?? new vscode.Position(0, 0);
 
-          const time: number = Date.now();
-          if (
-            isWrite ||
-            Utils.enoughTimePassed(this.lastHeartbeat, time) ||
-            this.lastFile !== file ||
-            this.lastDebug !== isDebuggingAtEvent ||
-            this.lastCompile !== isCompilingAtEvent ||
-            this.lastAICodeGenerating !== isAICodingAtEvent
-          ) {
-            this.appendHeartbeat(
-              doc,
-              time,
-              editor.selection.start,
-              isWrite,
-              isCompilingAtEvent,
-              isDebuggingAtEvent,
-              isAICodingAtEvent,
-            );
-            this.lastFile = file;
-            this.lastHeartbeat = time;
-            this.lastDebug = isDebuggingAtEvent;
-            this.lastCompile = isCompilingAtEvent;
-            this.lastAICodeGenerating = isAICodingAtEvent;
-          }
+      if (doc) {
+        const file = Utils.getFocusedFile(doc);
+        if (!file) {
+          return;
+        }
+        if (this.currentlyFocusedFile !== file) {
+          this.updateTeamStatusBarFromJson();
+          this.updateTeamStatusBar(doc);
+        }
+
+        const time: number = Date.now();
+        if (
+          isWrite ||
+          Utils.enoughTimePassed(this.lastHeartbeat, time) ||
+          this.lastFile !== file ||
+          this.lastDebug !== isDebuggingAtEvent ||
+          this.lastCompile !== isCompilingAtEvent ||
+          this.lastAICodeGenerating !== isAICodingAtEvent
+        ) {
+          this.appendHeartbeat(
+            doc,
+            time,
+            selection,
+            isWrite,
+            isCompilingAtEvent,
+            isDebuggingAtEvent,
+            isAICodingAtEvent,
+          );
+          this.lastFile = file;
+          this.lastHeartbeat = time;
+          this.lastDebug = isDebuggingAtEvent;
+          this.lastCompile = isCompilingAtEvent;
+          this.lastAICodeGenerating = isAICodingAtEvent;
         }
       }
     }, this.debounceMs);
@@ -717,8 +821,17 @@ export class WakaTime {
     }
 
     this.logger.debug(`Appending heartbeat to local buffer: ${JSON.stringify(heartbeat, null, 2)}`);
+    this.writeActivityLog('heartbeat', {
+      file,
+      project: heartbeat.alternate_project,
+      source: heartbeat.category ?? 'coding',
+      line: selection.line + 1,
+      lines: doc.lineCount,
+      is_write: isWrite ? 1 : 0,
+    });
     this.heartbeats.push(heartbeat);
 
+    // Send when 30s buffer has passed (same for human and AI)
     if (now - this.lastSent > SEND_BUFFER_SECONDS * 1000) {
       await this.sendHeartbeats();
     }
@@ -754,9 +867,8 @@ export class WakaTime {
     args.push('--lineno', String(heartbeat.lineno));
     args.push('--cursorpos', String(heartbeat.cursorpos));
     args.push('--lines-in-file', String(heartbeat.lines_in_file));
-    if (heartbeat.category) {
-      args.push('--category', heartbeat.category);
-    }
+    // always send category so backend never stores as "unknown"
+    args.push('--category', heartbeat.category ?? 'coding');
 
     if (heartbeat.ai_line_changes) {
       args.push('--ai-line-changes', String(heartbeat.ai_line_changes));
@@ -806,6 +918,18 @@ export class WakaTime {
 
     const binary = this.dependencies.getCliLocation();
     this.logger.debug(`Sending heartbeat: ${Utils.formatArguments(binary, args)}`);
+    const allHeartbeats = [heartbeat, ...extraHeartbeats];
+    const allEntities = allHeartbeats.map((h) => h.entity);
+    const allSources = allHeartbeats.map((h) => h.category ?? 'coding');
+    const allProjects = allHeartbeats.map((h) => h.alternate_project ?? '');
+    const allIsWrite = allHeartbeats.map((h) => (h.is_write ? 1 : 0));
+    this.writeActivityLog('send', {
+      files: allEntities.join(','),
+      projects: allProjects.join(','),
+      sources: allSources.join(','),
+      is_writes: allIsWrite.join(','),
+      count: allHeartbeats.length,
+    });
     const options = Desktop.buildOptions(extraHeartbeats.length > 0);
     const proc = child_process.execFile(binary, args, options, (error, stdout, stderr) => {
       if (error != null) {
@@ -815,9 +939,13 @@ export class WakaTime {
       }
     });
 
-    // send any extra heartbeats
+    // send any extra heartbeats (ensure category is always set so CLI/API never store as "unknown")
     if (proc.stdin) {
-      proc.stdin.write(JSON.stringify(extraHeartbeats));
+      const payload = extraHeartbeats.map((h) => ({
+        ...h,
+        category: h.category ?? 'coding',
+      }));
+      proc.stdin.write(JSON.stringify(payload));
       proc.stdin.write('\n');
       proc.stdin.end();
       cleanup.push(...(extraHeartbeats.map((h) => h.local_file).filter(Boolean) as string[]));
@@ -1126,11 +1254,6 @@ export class WakaTime {
     }
   }
 
-  private recentlyAIPasted(time: number): boolean {
-    this.AIrecentPastes = this.AIrecentPastes.filter((x) => x + AI_RECENT_PASTES_TIME_MS >= time);
-    return this.AIrecentPastes.length > 3;
-  }
-
   private isDuplicateHeartbeat(file: string, time: number, selection: vscode.Position): boolean {
     let duplicate = false;
     const minutes = 30;
@@ -1151,16 +1274,35 @@ export class WakaTime {
   }
 
   private getProjectName(uri: vscode.Uri): string {
+    if (!uri?.fsPath) return this.getProjectNameFallback();
+    const workspaceRoot = this.getProjectFolder(uri);
+    let dir = path.dirname(uri.fsPath);
+    for (;;) {
+      const insideWorkspace = !workspaceRoot || dir === workspaceRoot || dir.startsWith(workspaceRoot + path.sep);
+      if (insideWorkspace) {
+        const projectFile = path.join(dir, '.wakatime-project');
+        try {
+          if (fs.existsSync(projectFile)) {
+            const content = fs.readFileSync(projectFile, 'utf8');
+            const firstLine = content.split(/\r?\n/)[0]?.trim() ?? '';
+            if (firstLine) return firstLine;
+          }
+        } catch (e) {
+          this.logger.debugException(e);
+        }
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return this.getProjectNameFallback(uri);
+  }
+
+  private getProjectNameFallback(uri?: vscode.Uri): string {
     if (!vscode.workspace) return '';
-    const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
-    if (workspaceFolder) {
-      try {
-        return workspaceFolder.name;
-      } catch (e) {}
-    }
-    if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length) {
-      return vscode.workspace.workspaceFolders[0].name;
-    }
+    const workspaceFolder = uri ? vscode.workspace.getWorkspaceFolder(uri) : undefined;
+    if (workspaceFolder) return workspaceFolder.name;
+    if (vscode.workspace.workspaceFolders?.length) return vscode.workspace.workspaceFolders[0].name;
     return vscode.workspace.name || '';
   }
 

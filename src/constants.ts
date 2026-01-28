@@ -15,7 +15,10 @@ export enum LogLevel {
   ERROR,
 }
 
-export const AI_RECENT_PASTES_TIME_MS = 500;
+/** If user clicked/selected/typed in file within this ms, a following paste counts as human. */
+export const RECENT_USER_INTERACTION_MS = 10000;
+/** Change only counts as human if it's same line or within this many lines of the last cursor/selection/typing. Else = AI. */
+export const INTERACTION_NEAR_LINES = 2;
 export const TIME_BETWEEN_HEARTBEATS_MS = 120000;
 export const SEND_BUFFER_SECONDS = 30;
 
