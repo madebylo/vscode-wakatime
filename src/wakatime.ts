@@ -690,7 +690,7 @@ export class WakaTime {
       heartbeat.category = 'code reviewing';
     }
 
-    if (!heartbeat.category) heartbeat.category = 'human coding' as Heartbeat['category'];
+    if (!heartbeat.category) heartbeat.category = 'coding' as Heartbeat['category'];
 
     const project = this.getProjectName(doc.uri);
     if (project) heartbeat.alternate_project = project;
